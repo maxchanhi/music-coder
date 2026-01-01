@@ -198,7 +198,6 @@ class MusicCoderInterpreter:
                             # Store the skip count so we don't execute these notes later
                             self.loop_info[pc]['skip_count'] = lookahead_pc - (end_pc + 1)
                         else:
-                            # Original: Get count from next cell
                             next_ptr = self.ptr + 1
                             if next_ptr < len(self.tape):
                                 count_val = self.tape[next_ptr]
