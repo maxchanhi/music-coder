@@ -2,10 +2,11 @@ import sys
 import re
 
 class MusicCoderInterpreter:
-    def __init__(self, source_code):
+    def __init__(self, source_code, debug=False):
         self.source_code = source_code
         self.tape = [0] * 30000
         self.ptr = 0
+        self.debug = debug
         
         # Note values (MIDI numbers, C-1=0 C4=60))
         self.note_map = {}
@@ -30,6 +31,9 @@ class MusicCoderInterpreter:
         self.loop_info = {} # Stores metadata for loops (e.g., fixed counts)
 
     def tokenize(self):
+        # Remove comments <!-- ... -->
+        clean_code = re.sub(r'<!--[^>]*>', '', self.source_code, flags=re.DOTALL)
+
         # Regex explanation:
         # \|:       -> Start Loop
         # :\|(?:x\d+|R4)? -> End Loop (optional xN or R4)
@@ -40,7 +44,7 @@ class MusicCoderInterpreter:
         
         # Updated regex to allow whitespace in loop suffix
         pattern = r'\|:|:\|(?:\s*(?:x\d+|R4))?|R4|R2|\||[A-G](?:#|b)?-?\d?(?:[._]+)?'
-        raw_tokens = re.findall(pattern, self.source_code, re.IGNORECASE)
+        raw_tokens = re.findall(pattern, clean_code, re.IGNORECASE)
         
         parsed_tokens = []
         for t in raw_tokens:
@@ -49,7 +53,7 @@ class MusicCoderInterpreter:
                 parsed_tokens.append({'type': 'LOOP_START'})
             elif t_upper.startswith(':|'):
                 # Check for xN or R4
-                count = 1 # Default to 1 time
+                count = 'BF' # Default to Brainfuck mode
                 is_infinite = False
                 use_next_cell = False
                 
@@ -141,13 +145,20 @@ class MusicCoderInterpreter:
         # Loop counters for fixed loops: { loop_start_pc: remaining_iterations }
         active_loops = {}
 
+        if self.debug:
+            print("DEBUG: Starting execution")
+            print(f"DEBUG: Tape size: {len(self.tape)}")
+
         while pc < len(self.tokens):
             token = self.tokens[pc]
             ctype = token['type']
             
+            if self.debug:
+                print(f"DEBUG: PC={pc}, Token={ctype}, Ptr={self.ptr}, Val={self.tape[self.ptr]}, PrevNote={prev_val}")
+
             if ctype == 'REST_H': # R2 -> Left
                 self.ptr -= 1
-                prev_val = 0 # Reset previous note to 0
+                prev_val = 0 # Reset previous note
                 if self.ptr < 0:
                      # Pointer can't go left of 0
                      pass 
@@ -157,7 +168,7 @@ class MusicCoderInterpreter:
             
             elif ctype == 'REST_Q': # R4 -> Right
                 self.ptr += 1
-                prev_val = 0 # Reset previous note to 0
+                prev_val = 0 # Reset previous note
                 if self.ptr >= len(self.tape):
                     self.tape.append(0)
 
@@ -165,11 +176,15 @@ class MusicCoderInterpreter:
             elif ctype == 'LOOP_START':
                 info = self.loop_info.get(pc)
                 
+                if info['count'] == 'BF':
+                    if self.tape[self.ptr] == 0:
+                        pc = self.loop_map[pc]
+
                 # Logic is now purely count-based (or infinite)
                 # If infinite, count is None, infinite is True
                 # If fixed, count is N, infinite is False
 
-                if pc not in active_loops:
+                elif pc not in active_loops:
                     if info['infinite']:
                         active_loops[pc] = -1 # Special marker for infinite
                     elif info['use_next_cell']:
@@ -210,23 +225,28 @@ class MusicCoderInterpreter:
             
             elif ctype == 'LOOP_END':
                 start_pc = self.loop_map[pc]
+                info = self.loop_info.get(start_pc)
                 
-                current_count = active_loops.get(start_pc)
-                
-                if current_count == -1:
-                    # Infinite Loop
-                    pc = start_pc
-                elif current_count is not None:
-                    # Decrement remaining iterations
-                    active_loops[start_pc] -= 1
-                    if active_loops[start_pc] > 0:
-                            pc = start_pc
-                    else:
-                            # Loop Finished
-                            # Skip the notes that were used as count (if any)
-                            skip_count = self.loop_info[start_pc].get('skip_count', 0)
-                            pc += skip_count
-                            del active_loops[start_pc]
+                if info['count'] == 'BF':
+                    if self.tape[self.ptr] != 0:
+                        pc = start_pc
+                else:
+                    current_count = active_loops.get(start_pc)
+                    
+                    if current_count == -1:
+                        # Infinite Loop
+                        pc = start_pc
+                    elif current_count is not None:
+                        # Decrement remaining iterations
+                        active_loops[start_pc] -= 1
+                        if active_loops[start_pc] > 0:
+                                pc = start_pc
+                        else:
+                                # Loop Finished
+                                # Skip the notes that were used as count (if any)
+                                skip_count = self.loop_info[start_pc].get('skip_count', 0)
+                                pc += skip_count
+                                del active_loops[start_pc]
             
             elif ctype == 'NOTE':
                 current_val = token['value']
@@ -239,9 +259,44 @@ class MusicCoderInterpreter:
                     # Descending: Subtract Current Note
                     self.tape[self.ptr] = (self.tape[self.ptr] - current_val) % 256
                 else:
-                    # Equal: No Op 
-                    pass
-                
+                    # Equal: Look ahead to the NEXT note to determine operation
+                    lookahead_pc = pc + 1
+                    if lookahead_pc < len(self.tokens) and self.tokens[lookahead_pc]['type'] == 'NOTE':
+                        next_val = self.tokens[lookahead_pc]['value']
+                        diff = next_val - current_val
+                        self.tape[self.ptr] = (self.tape[self.ptr] + diff) % 256
+                        
+                        # We must SKIP the next note because we just used it for "Brainfuck Arithmetic"
+                        # If we don't skip, the next iteration will see Prev=Current, Next=Next, and perform standard Asc/Desc
+                        # which adds large values.
+                        
+                        # Handle I/O flags of the CONSUMED note (since we skip its iteration)
+                        consumed_token = self.tokens[lookahead_pc]
+                        if consumed_token['staccato']:
+                             sys.stdout.write(chr(self.tape[self.ptr]))
+                        if consumed_token['legato']:
+                             try:
+                                 char = sys.stdin.read(1)
+                                 if char:
+                                     self.tape[self.ptr] = ord(char)
+                                 else:
+                                     self.tape[self.ptr] = 0
+                             except:
+                                 self.tape[self.ptr] = 0
+
+                        pc += 1 # Advance PC to skip the next note
+                        
+                        # Update prev_val to the NOTE WE JUST CONSUMED
+                        # This ensures continuity for the note AFTER the consumed one.
+                        # Example: C4 -> C4 -> C#4 -> D4
+                        # 1. C4 (+60). prev=60.
+                        # 2. C4 (==). Lookahead C#4. Add +1. Tape=61. Skip C#4.
+                        #    We need prev to be C#4 (61) so that D4 (62) is processed as 62>61?
+                        #    Or should prev remain C4 (60)?
+                        #    If this is just "+", we transitioned from C4 to C#4 state.
+                        
+                        current_val = next_val # Update current_val so prev_val gets updated correctly below
+                    
                 # Update previous value
                 prev_val = current_val
                 
@@ -261,11 +316,14 @@ class MusicCoderInterpreter:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python interpreter.py <source_file>")
+        print("Usage: python interpreter.py <source_file> [--debug]")
         sys.exit(1)
         
-    with open(sys.argv[1], 'r') as f:
+    source_file = sys.argv[1]
+    debug_mode = "--debug" in sys.argv
+
+    with open(source_file, 'r') as f:
         code = f.read()
     
-    interpreter = MusicCoderInterpreter(code)
+    interpreter = MusicCoderInterpreter(code, debug=debug_mode)
     interpreter.run()
